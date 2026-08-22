@@ -1,0 +1,209 @@
+import os
+import uuid
+import json
+from typing import Generator
+
+import cohere
+import chromadb
+from groq import Groq
+from dotenv import load_dotenv
+
+from llama_index.core import VectorStoreIndex, StorageContext
+from llama_index.core.settings import Settings
+from llama_index.core.node_parser import SentenceSplitter
+from llama_index.embeddings.cohere import CohereEmbedding
+from llama_index.vector_stores.chroma import ChromaVectorStore
+from llama_index.postprocessor.cohere_rerank import CohereRerank
+
+load_dotenv()
+
+COHERE_API_KEY  = os.getenv("COHERE_API_KEY")
+GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
+CHROMA_PATH     = "./chroma_store"
+DOCS_META_PATH  = "./chroma_store/docs_meta.json"
+COLLECTION_NAME = "documind_store"
+
+# ── Clients ───────────────────────────────────────────────────────────────────
+co   = cohere.Client(api_key=COHERE_API_KEY)
+groq = Groq(api_key=GROQ_API_KEY)
+
+# ── Embeddings (Cohere) ───────────────────────────────────────────────────────
+Settings.embed_model = CohereEmbedding(
+    cohere_api_key=COHERE_API_KEY,
+    model_name="embed-v4.0",
+    input_type="search_document",
+)
+Settings.llm = None   # We handle LLM calls ourselves
+
+# ── ChromaDB ──────────────────────────────────────────────────────────────────
+os.makedirs(CHROMA_PATH, exist_ok=True)
+chroma_client     = chromadb.PersistentClient(path=CHROMA_PATH)
+chroma_collection = chroma_client.get_or_create_collection(COLLECTION_NAME)
+vector_store      = ChromaVectorStore(chroma_collection=chroma_collection)
+storage_context   = StorageContext.from_defaults(vector_store=vector_store)
+
+# ── Reranker (Cohere) ─────────────────────────────────────────────────────────
+reranker = CohereRerank(api_key=COHERE_API_KEY, top_n=3)
+
+# ── Global state ──────────────────────────────────────────────────────────────
+_index: VectorStoreIndex | None = None
+_chat_history: list[dict] = []
+
+
+# ── Doc metadata persistence ──────────────────────────────────────────────────
+def _load_docs_meta() -> list[dict]:
+    if os.path.exists(DOCS_META_PATH):
+        try:
+            with open(DOCS_META_PATH, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+
+def _save_docs_meta(docs: list[dict]):
+    with open(DOCS_META_PATH, "w") as f:
+        json.dump(docs, f, indent=2)
+
+
+# ── Index helper ──────────────────────────────────────────────────────────────
+def _get_index() -> VectorStoreIndex:
+    global _index
+    if _index is None:
+        _index = VectorStoreIndex.from_vector_store(
+            vector_store, storage_context=storage_context
+        )
+    return _index
+
+
+def _build_messages(system: str, question: str) -> list[dict]:
+    messages = [{"role": "system", "content": system}]
+    for m in _chat_history[-6:]:
+        messages.append({"role": m["role"], "content": m["content"]})
+    messages.append({"role": "user", "content": question})
+    return messages
+
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def _extract_text(filepath: str, filename: str) -> list:
+    """Extract clean text. Uses pdfminer for PDFs, plain read for txt."""
+    from llama_index.core.schema import Document as LIDocument
+
+    if filename.lower().endswith(".pdf"):
+        from pdfminer.high_level import extract_pages
+        from pdfminer.layout import LTTextContainer
+        pages = []
+        for page_num, page_layout in enumerate(extract_pages(filepath), start=1):
+            page_text = ""
+            for element in page_layout:
+                if isinstance(element, LTTextContainer):
+                    page_text += element.get_text()
+            if page_text.strip():
+                pages.append(LIDocument(
+                    text=page_text,
+                    metadata={"source": filename, "page": page_num, "doc_id": str(uuid.uuid4())}
+                ))
+        return pages
+    else:
+        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+        return [LIDocument(text=text, metadata={"source": filename, "doc_id": str(uuid.uuid4())})]
+
+
+def ingest_document(filepath: str, filename: str) -> dict:
+    """Parse, chunk, embed and persist a new document."""
+    documents = _extract_text(filepath, filename)
+
+    for doc in documents:
+        doc.metadata["source"] = filename
+        doc.metadata["doc_id"] = str(uuid.uuid4())
+
+    splitter = SentenceSplitter(chunk_size=512, chunk_overlap=64)
+    nodes    = splitter.get_nodes_from_documents(documents)
+
+    _get_index().insert_nodes(nodes)
+
+    meta = {
+        "id":      str(uuid.uuid4()),
+        "name":    filename,
+        "chunks":  len(nodes),
+        "pages":   len(documents),
+        "size_kb": round(os.path.getsize(filepath) / 1024, 1),
+    }
+    docs = _load_docs_meta()
+    docs.append(meta)
+    _save_docs_meta(docs)
+    return meta
+
+
+def query_stream(question: str) -> Generator[str, None, None]:
+    """Retrieve → rerank → stream answer via Groq."""
+    retriever = _get_index().as_retriever(similarity_top_k=8)
+    nodes     = retriever.retrieve(question)
+    reranked  = reranker.postprocess_nodes(nodes, query_str=question)
+
+    context_parts, sources = [], []
+    for n in reranked:
+        context_parts.append(n.get_content())
+        src = n.metadata.get("source", "unknown")
+        if src not in sources:
+            sources.append(src)
+
+    system_prompt = (
+        "You are DocuMind, a precise document intelligence assistant.\n"
+        "Answer ONLY from the context below. Be concise but thorough.\n"
+        "If the answer is not in the context, say exactly: "
+        "'I could not find this information in the uploaded documents.'\n\n"
+        "Context:\n"
+        "---------------------\n"
+        + "\n\n---\n\n".join(context_parts)
+        + "\n---------------------"
+    )
+
+    messages = _build_messages(system_prompt, question)
+
+    full_answer = ""
+    stream = groq.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=messages,
+        temperature=0.3,
+        max_tokens=1024,
+        stream=True,
+    )
+
+    for chunk in stream:
+        token = chunk.choices[0].delta.content
+        if token:
+            full_answer += token
+            yield token
+
+    if sources:
+        src_text = "\n\n📎 **Sources:** " + ", ".join(sources)
+        yield src_text
+        full_answer += src_text
+
+    _chat_history.append({"role": "user",      "content": question})
+    _chat_history.append({"role": "assistant",  "content": full_answer})
+
+
+def get_uploaded_docs() -> list[dict]:
+    return _load_docs_meta()
+
+
+def clear_history():
+    global _chat_history
+    _chat_history = []
+
+
+def delete_all_documents():
+    global _index, _chat_history, chroma_collection, vector_store, storage_context
+    chroma_client.delete_collection(COLLECTION_NAME)
+    # Reinitialize all references to point to the new fresh collection
+    chroma_collection = chroma_client.get_or_create_collection(COLLECTION_NAME)
+    vector_store      = ChromaVectorStore(chroma_collection=chroma_collection)
+    storage_context   = StorageContext.from_defaults(vector_store=vector_store)
+    _index        = None
+    _chat_history = []
+    if os.path.exists(DOCS_META_PATH):
+        os.remove(DOCS_META_PATH)
