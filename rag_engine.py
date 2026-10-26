@@ -6,15 +6,14 @@ import time
 from typing import Generator
 
 import cohere
-import chromadb
 from groq import Groq
 from dotenv import load_dotenv
 
 from llama_index.core import VectorStoreIndex, StorageContext
 from llama_index.core.settings import Settings
 from llama_index.core.node_parser import SentenceSplitter
+from llama_index.core.vector_stores import SimpleVectorStore
 from llama_index.embeddings.cohere import CohereEmbedding
-from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.postprocessor.cohere_rerank import CohereRerank
 
 logging.basicConfig(level=logging.INFO)
@@ -24,8 +23,6 @@ load_dotenv()
 
 COHERE_API_KEY  = os.getenv("COHERE_API_KEY")
 GROQ_API_KEY    = os.getenv("GROQ_API_KEY")
-CHROMA_PATH     = "./chroma_store"
-DOCS_META_PATH  = "./chroma_store/docs_meta.json"
 COLLECTION_NAME = "documind_store"
 
 # ── Clients ───────────────────────────────────────────────────────────────────
@@ -43,10 +40,8 @@ Settings.embed_model = CohereEmbedding(
 Settings.llm = None   # We handle LLM calls ourselves
 
 # ── ChromaDB ──────────────────────────────────────────────────────────────────
-os.makedirs(CHROMA_PATH, exist_ok=True)
-chroma_client     = chromadb.PersistentClient(path=CHROMA_PATH)
-chroma_collection = chroma_client.get_or_create_collection(COLLECTION_NAME)
-vector_store      = ChromaVectorStore(chroma_collection=chroma_collection)
+# Render's free service has no persistent disk; keep this demo index in memory.
+vector_store      = SimpleVectorStore()
 storage_context   = StorageContext.from_defaults(vector_store=vector_store)
 
 # ── Reranker (Cohere) ─────────────────────────────────────────────────────────
@@ -55,31 +50,24 @@ reranker = CohereRerank(api_key=COHERE_API_KEY, top_n=3)
 # ── Global state ──────────────────────────────────────────────────────────────
 _index: VectorStoreIndex | None = None
 _chat_history: list[dict] = []
+_docs_meta: list[dict] = []
 
 
 # ── Doc metadata persistence ──────────────────────────────────────────────────
 def _load_docs_meta() -> list[dict]:
-    if os.path.exists(DOCS_META_PATH):
-        try:
-            with open(DOCS_META_PATH, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return []
+    return list(_docs_meta)
 
 
 def _save_docs_meta(docs: list[dict]):
-    with open(DOCS_META_PATH, "w") as f:
-        json.dump(docs, f, indent=2)
+    global _docs_meta
+    _docs_meta = list(docs)
 
 
 # ── Index helper ──────────────────────────────────────────────────────────────
 def _get_index() -> VectorStoreIndex:
     global _index
     if _index is None:
-        _index = VectorStoreIndex.from_vector_store(
-            vector_store, storage_context=storage_context
-        )
+        _index = VectorStoreIndex([], storage_context=storage_context)
     return _index
 
 
@@ -215,13 +203,9 @@ def clear_history():
 
 
 def delete_all_documents():
-    global _index, _chat_history, chroma_collection, vector_store, storage_context
-    chroma_client.delete_collection(COLLECTION_NAME)
-    # Reinitialize all references to point to the new fresh collection
-    chroma_collection = chroma_client.get_or_create_collection(COLLECTION_NAME)
-    vector_store      = ChromaVectorStore(chroma_collection=chroma_collection)
+    global _index, _chat_history, _docs_meta, vector_store, storage_context
+    vector_store      = SimpleVectorStore()
     storage_context   = StorageContext.from_defaults(vector_store=vector_store)
     _index        = None
     _chat_history = []
-    if os.path.exists(DOCS_META_PATH):
-        os.remove(DOCS_META_PATH)
+    _docs_meta    = []
