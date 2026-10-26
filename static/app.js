@@ -25,13 +25,19 @@
 
     try {
       const res = await fetch('/upload', { method: 'POST', body: fd });
-      const data = await res.json();
+      let data;
+      try {
+        data = await res.json();
+      } catch {
+        throw new Error('The server stopped before finishing this upload. The PDF may be too large or complex; try a smaller or text-based PDF.');
+      }
+      if (!res.ok) throw new Error(data.error || `Upload failed (HTTP ${res.status})`);
       if (data.error) throw new Error(data.error);
       addDocToList(data.doc);
       showToast(`✅ "${data.doc.name}" ingested — ${data.doc.chunks} chunks`, 'success');
       hideWelcome();
     } catch (err) {
-      showToast(`❌ ${err.message}`, 'error');
+      showToast(`❌ ${err.message || 'Upload failed. Please try again.'}`, 'error');
     } finally {
       showProgress(false);
       fileInput.value = '';
