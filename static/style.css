@@ -311,6 +311,13 @@ form button:hover {
       display: none;
     }
 
+    .upload-status {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 10px;
+      line-height: 1.5;
+    }
+
     .progress-bar {
       height: 3px;
       background: var(--border);
