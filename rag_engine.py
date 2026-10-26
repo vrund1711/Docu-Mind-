@@ -104,10 +104,16 @@ def _extract_text(filepath: str, filename: str) -> list:
                     text=page_text,
                     metadata={"source": filename, "page": page_num, "doc_id": str(uuid.uuid4())}
                 ))
+        if not pages:
+            raise ValueError(
+                "No readable text was found in this PDF. It may be scanned; run OCR on it and upload the searchable PDF."
+            )
         return pages
     else:
         with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
             text = f.read()
+        if not text.strip():
+            raise ValueError("This text file is empty or contains no readable text.")
         return [LIDocument(text=text, metadata={"source": filename, "doc_id": str(uuid.uuid4())})]
 
 
