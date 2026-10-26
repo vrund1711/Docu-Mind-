@@ -1,6 +1,8 @@
 import os
 import uuid
 import json
+import logging
+import time
 from typing import Generator
 
 import cohere
@@ -14,6 +16,9 @@ from llama_index.core.node_parser import SentenceSplitter
 from llama_index.embeddings.cohere import CohereEmbedding
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.postprocessor.cohere_rerank import CohereRerank
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -32,6 +37,8 @@ Settings.embed_model = CohereEmbedding(
     cohere_api_key=COHERE_API_KEY,
     model_name="embed-v4.0",
     input_type="search_document",
+    timeout=45.0,
+    max_retries=2,
 )
 Settings.llm = None   # We handle LLM calls ourselves
 
@@ -119,7 +126,10 @@ def _extract_text(filepath: str, filename: str) -> list:
 
 def ingest_document(filepath: str, filename: str) -> dict:
     """Parse, chunk, embed and persist a new document."""
+    started = time.monotonic()
+    logger.info("Upload %s: extracting text", filename)
     documents = _extract_text(filepath, filename)
+    logger.info("Upload %s: extracted %s pages", filename, len(documents))
 
     for doc in documents:
         doc.metadata["source"] = filename
@@ -127,8 +137,10 @@ def ingest_document(filepath: str, filename: str) -> dict:
 
     splitter = SentenceSplitter(chunk_size=512, chunk_overlap=64)
     nodes    = splitter.get_nodes_from_documents(documents)
+    logger.info("Upload %s: created %s chunks; embedding and saving", filename, len(nodes))
 
     _get_index().insert_nodes(nodes)
+    logger.info("Upload %s: indexing finished in %.1f seconds", filename, time.monotonic() - started)
 
     meta = {
         "id":      str(uuid.uuid4()),
