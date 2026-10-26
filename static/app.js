@@ -146,6 +146,7 @@
 
     let fullText = '';
     let sourceText = '';
+    let streamError = '';
 
     try {
       const res = await fetch('/ask', {
@@ -175,22 +176,30 @@
           const raw = line.slice(6).trim();
           if (raw === '[DONE]') continue;
 
+          let parsed;
           try {
-            const parsed = JSON.parse(raw);
-            if (parsed.error) throw new Error(parsed.error);
-            if (parsed.token) {
-              const token = parsed.token;
-              // Detect sources line
-              if (token.includes('📎 **Sources:**')) {
-                sourceText += token;
-              } else {
-                fullText += token;
-              }
-              renderBubble(bubble, fullText, sourceText);
+            parsed = JSON.parse(raw);
+          } catch {
+            continue;
+          }
+          if (parsed.error) {
+            streamError = parsed.error;
+            continue;
+          }
+          if (parsed.token) {
+            const token = parsed.token;
+            // Detect sources line
+            if (token.includes('📎 **Sources:**')) {
+              sourceText += token;
+            } else {
+              fullText += token;
             }
-          } catch {}
+            renderBubble(bubble, fullText, sourceText);
+          }
         }
       }
+
+      if (streamError) throw new Error(streamError);
     } catch (err) {
       bubble.remove();
       addError(err.message);
